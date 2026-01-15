@@ -8,6 +8,7 @@
  */
 
 #include <Wire.h>
+#include "MAX30105.h"
 
 // ============================================================================
 // Configuration
@@ -16,16 +17,17 @@
 #define SAMPLE_INTERVAL_US  62500  // 16 Hz = 62.5ms
 
 // I2C
-#define I2C_SDA  8
-#define I2C_SCL  9
+#define I2C_SDA  6
+#define I2C_SCL  7
 
 // Sensor addresses
 #define IMU_ADDR  0x6A  // LSM6DS3TR-C
-#define PPG_ADDR  0x57  // MAX30101
 
 // ============================================================================
 // Globals
 // ============================================================================
+
+MAX30105 ppgSensor;
 
 volatile bool sampleReady = false;
 hw_timer_t *timer = NULL;
@@ -60,8 +62,29 @@ void i2cReadN(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t n) {
   }
 }
 
+void i2cScan() {
+  Serial.println("# Scanning I2C bus...");
+  uint8_t count = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("#   Found device at 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.println(addr, HEX);
+      count++;
+    }
+  }
+  if (count == 0) {
+    Serial.println("#   No I2C devices found!");
+  } else {
+    Serial.print("# I2C scan complete. Devices found: ");
+    Serial.println(count);
+  }
+  Serial.println();
+}
+
 // ============================================================================
-// LSM6DS3TR-C (Accelerometer)
+// LSM6DS3TR-C (Accelerometer) - ORIGINAL METHOD
 // ============================================================================
 
 bool initIMU() {
@@ -96,49 +119,68 @@ void readIMU(int16_t *ax, int16_t *ay, int16_t *az) {
 }
 
 // ============================================================================
-// MAX30101 (PPG - IR Channel)
+// MAX30101 (PPG) - SPARKFUN LIBRARY METHOD
 // ============================================================================
 
 bool initPPG() {
-  // Check Part ID (should be 0x15)
-  if (i2cRead(PPG_ADDR, 0xFF) != 0x15) return false;
+  Serial.println("# Initializing MAX30101...");
+  
+  // Initialize MAX30101 with SparkFun library
+  if (!ppgSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("# ERROR: MAX30101 init failed (begin() returned false)");
+    Serial.println("# Check:");
+    Serial.println("#   - Wiring (SDA/SCL)");
+    Serial.println("#   - Power (3.3V not 5V)");
+    Serial.println("#   - I2C address (should be 0x57)");
+    return false;
+  }
 
-  // Reset
-  i2cWrite(PPG_ADDR, 0x09, 0x40);
-  delay(100);
+  // Configure MAX30101 with optimal settings
+  // Parameters: ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange
+  
+  byte ledBrightness = 60;     // Moderate brightness: 0-255 (60 ≈ 12mA)
+  byte sampleAverage = 4;      // Average 4 samples (reduces noise)
+  byte ledMode = 2;            // Mode 2: Red + IR LEDs
+  int sampleRate = 100;        // 100 Hz sampling
+  int pulseWidth = 411;        // 411 µs pulse width (18-bit resolution)
+  int adcRange = 4096;         // 4096 nA range
 
-  // FIFO config: 4-sample average, rollover enabled
-  i2cWrite(PPG_ADDR, 0x08, 0x50);
+  ppgSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
 
-  // Mode: Heart Rate only (IR LED)
-  i2cWrite(PPG_ADDR, 0x09, 0x02);
+  Serial.println("# MAX30101 configured:");
+  Serial.printf("#   LED Brightness: %d (0-255)\n", ledBrightness);
+  Serial.printf("#   Sample Average: %d\n", sampleAverage);
+  Serial.printf("#   LED Mode: %d (2=Red+IR)\n", ledMode);
+  Serial.printf("#   Sample Rate: %d Hz\n", sampleRate);
+  Serial.printf("#   Pulse Width: %d µs\n", pulseWidth);
+  Serial.printf("#   ADC Range: %d nA\n", adcRange);
 
-  // SpO2 config: 100 sps, 411µs pulse, 4096 range
-  i2cWrite(PPG_ADDR, 0x0A, 0x27);
-
-  // IR LED current (~16mA)
-  i2cWrite(PPG_ADDR, 0x0D, 0x50);
-
-  // Clear FIFO
-  i2cWrite(PPG_ADDR, 0x04, 0x00);
-  i2cWrite(PPG_ADDR, 0x05, 0x00);
-  i2cWrite(PPG_ADDR, 0x06, 0x00);
-
+  // Test reading to verify LED is on
+  delay(300);
+  Serial.println("# Testing PPG readings...");
+  
+  for (int i = 0; i < 5; i++) {
+    uint32_t ir = ppgSensor.getIR();
+    uint32_t red = ppgSensor.getRed();
+    Serial.printf("#   Sample %d - IR: %lu, RED: %lu\n", i, ir, red);
+    
+    if (ir > 50000 || red > 50000) {
+      Serial.println("# PPG LED confirmed working!");
+      break;
+    }
+    delay(100);
+  }
+  
+  Serial.println("# MAX30101 initialized successfully");
+  Serial.println("# Note: IR LED visible with phone camera (purple glow)");
+  Serial.println("#       RED LED visible to naked eye");
+  
   return true;
 }
 
 uint32_t readPPG() {
-  // Check if data available
-  uint8_t wr = i2cRead(PPG_ADDR, 0x04);
-  uint8_t rd = i2cRead(PPG_ADDR, 0x06);
-  if (wr == rd) return 0;  // No new data
-
-  // Read one sample (3 bytes for IR in HR mode)
-  uint8_t buf[3];
-  i2cReadN(PPG_ADDR, 0x07, buf, 3);
-
-  // 18-bit value
-  return ((uint32_t)(buf[0] & 0x03) << 16) | ((uint32_t)buf[1] << 8) | buf[2];
+  // Read IR channel (primary for heart rate)
+  return ppgSensor.getIR();
 }
 
 // ============================================================================
@@ -157,21 +199,42 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
+  Serial.println("\n# ========================================");
+  Serial.println("# LipsyGuard Firmware Starting...");
+  Serial.println("# ========================================");
+
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
+  
+  Serial.printf("# I2C: SDA=%d, SCL=%d\n", I2C_SDA, I2C_SCL);
+  Serial.println();
+
+  // Scan I2C bus
+  i2cScan();
 
   // Initialize sensors
   if (!initIMU()) {
     Serial.println("# ERROR: IMU not found");
     while (1) delay(1000);
   }
+  Serial.println("# IMU initialized successfully");
 
   if (!initPPG()) {
-    Serial.println("# ERROR: PPG not found");
+    Serial.println("# ERROR: PPG initialization failed");
     while (1) delay(1000);
   }
 
-  Serial.println("# LipsyGuard ready");
+  Serial.println("\n# ========================================");
+  Serial.println("# LipsyGuard Ready");
+  Serial.println("# ========================================");
+  Serial.println("# Format: timestamp_ms,accel_x,accel_y,accel_z,ppg_ir");
+  Serial.println("# Units: time(ms), accel(milli-g), ppg(ADC counts)");
+  Serial.println("# Sampling rate: 16 Hz");
+  Serial.println("#");
+  Serial.println("# PLACE FINGER ON PPG SENSOR");
+  Serial.println("# ========================================\n");
+
+  delay(1000);
 
   // Start 16 Hz timer
   timer = timerBegin(0, 80, true);  // 1 MHz tick
