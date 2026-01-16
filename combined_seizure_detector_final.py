@@ -73,7 +73,7 @@ class AccelerometerSeizureDetector:
 class HRVSeizureDetector:
     """Real-time HRV-based seizure detector using PPG signal processing"""
 
-    def __init__(self, sampling_rate=16.0, seizure_threshold=50.0):
+    def __init__(self, sampling_rate=16.0, seizure_threshold=85.0):
         self.sampling_rate = sampling_rate
         self.seizure_threshold = seizure_threshold
 
@@ -234,14 +234,14 @@ class HRVSeizureDetector:
 class CombinedSeizureDetector:
     """
     Combined seizure detector with weighted predictions:
-    - Accelerometer ML: 70%
-    - HRV Analysis: 30%
+    - Accelerometer ML: 90%
+    - HRV Analysis: 10%
     """
 
     def __init__(self, model_path='triaxial_seizure_model.keras',
                  encoder_path='triaxial_seizure_encoder.pkl',
                  stats_path='axis_normalization_stats.pkl',
-                 accel_weight=0.7, hrv_weight=0.3):
+                 accel_weight=0.9, hrv_weight=0.1):
 
         print("Initializing Combined Seizure Detector...")
         print(f"  Accelerometer weight: {accel_weight*100:.0f}%")
