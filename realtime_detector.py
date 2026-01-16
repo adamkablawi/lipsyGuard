@@ -1,28 +1,25 @@
-"""
-Real-time Seizure Detection via Bluetooth Serial
-
-Reads sensor data from ESP32 over serial, buffers 200 samples (12.5s at 16Hz),
-and triggers inference using CombinedSeizureDetector.
-
-Packet format from ESP32: timestamp_ms,accel_x,accel_y,accel_z,ppg\n
-"""
-
 import sys
 import time
 import threading
 import logging
 from collections import deque
+import asyncio
 
-import serial
 import numpy as np
+from bleak import BleakScanner, BleakClient
 
 from combined_seizure_detector_final import CombinedSeizureDetector
 
+# ============================================================================
 # Configuration
+# ============================================================================
+
 SAMPLE_RATE_HZ = 16
 WINDOW_SAMPLES = 200
 WINDOW_DURATION_SEC = WINDOW_SAMPLES / SAMPLE_RATE_HZ  # 12.5 seconds
-BAUD_RATE = 115200
+
+DEVICE_NAME = "LipsyGuard"
+CHAR_UUID = "abcdefab-1234-5678-1234-abcdefabcdef"
 
 # Logging setup
 logging.basicConfig(
@@ -32,6 +29,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+# ============================================================================
+# Buffer + Parsing (unchanged)
+# ============================================================================
 
 class SensorBuffer:
     """Thread-safe rolling buffer for sensor data."""
@@ -47,7 +48,6 @@ class SensorBuffer:
         self.last_timestamp = None
 
     def append(self, timestamp_ms, ax, ay, az, ppg):
-        """Add a sample to all buffers atomically."""
         with self.lock:
             self.accel_x.append(ax)
             self.accel_y.append(ay)
@@ -55,7 +55,6 @@ class SensorBuffer:
             self.ppg.append(ppg)
             self.sample_count += 1
 
-            # Check for timestamp discontinuity (>100ms gap suggests dropped samples)
             if self.last_timestamp is not None:
                 gap_ms = timestamp_ms - self.last_timestamp
                 if gap_ms > 100:
@@ -63,10 +62,6 @@ class SensorBuffer:
             self.last_timestamp = timestamp_ms
 
     def get_window(self):
-        """
-        Return current buffer contents as numpy arrays.
-        Returns (accel_x, accel_y, accel_z, ppg, sample_count) or None if insufficient data.
-        """
         with self.lock:
             count = len(self.accel_x)
             if count < self.maxlen:
@@ -81,7 +76,6 @@ class SensorBuffer:
             )
 
     def clear(self):
-        """Clear all buffers."""
         with self.lock:
             self.accel_x.clear()
             self.accel_y.clear()
@@ -91,19 +85,18 @@ class SensorBuffer:
             self.last_timestamp = None
 
 
-def parse_packet(line):
+def parse_packet(line: str):
     """
     Parse a CSV packet from ESP32.
 
-    Expected format: timestamp_ms,accel_x,accel_y,accel_z,ppg
-    Returns (timestamp_ms, ax, ay, az, ppg) or None on parse failure.
-    Lines starting with # are status/debug lines and return None.
+    Expected: timestamp_ms,accel_x,accel_y,accel_z,ppg
+    Returns tuple or None.
     """
     try:
+        print("Got packet")
         line = line.strip()
 
-        # Skip status/debug lines (prefixed with #)
-        if line.startswith('#'):
+        if not line or line.startswith('#'):
             return None
 
         parts = line.split(',')
@@ -122,28 +115,34 @@ def parse_packet(line):
         return None
 
 
-class RealtimeSeizureDetector:
+# ============================================================================
+# BLE Realtime Detector
+# ============================================================================
+
+class RealtimeSeizureDetectorBLE:
     """
-    Main class that coordinates serial reading, buffering, and inference.
+    Coordinates BLE reading (notifications), buffering, and inference.
+    BLE notifications arrive on an asyncio loop; inference runs in a normal thread.
     """
 
-    def __init__(self, serial_port, baud_rate=BAUD_RATE):
-        self.serial_port = serial_port
-        self.baud_rate = baud_rate
+    def __init__(self, device_name=DEVICE_NAME, char_uuid=CHAR_UUID):
+        self.device_name = device_name
+        self.char_uuid = char_uuid
 
         self.buffer = SensorBuffer(maxlen=WINDOW_SAMPLES)
-        self.detector = None  # Lazy init to fail fast on missing model files
-
-        self.serial_conn = None
-        self.reader_thread = None
-        self.inference_thread = None
+        self.detector = None
 
         self.running = False
+        self.inference_thread = None
+
         self.inference_count = 0
         self.parse_errors = 0
+        self.lines_ok = 0
+
+        # BLE parsing: notifications may contain partial/multiple lines
+        self._rx_text_buffer = ""
 
     def _init_detector(self):
-        """Initialize ML detector (separate to catch model loading errors early)."""
         log.info("Loading ML model...")
         self.detector = CombinedSeizureDetector(
             model_path='triaxial_seizure_model.keras',
@@ -151,53 +150,50 @@ class RealtimeSeizureDetector:
             stats_path='axis_normalization_stats.pkl'
         )
 
-    def _serial_reader(self):
-        """Thread: continuously read and parse serial data."""
-        log.info(f"Serial reader started on {self.serial_port}")
+    def _handle_text_chunk(self, chunk: str):
+        """
+        Append incoming text chunk, split into lines, parse each full line.
+        """
+        self._rx_text_buffer += chunk
 
-        while self.running:
-            try:
-                if self.serial_conn.in_waiting > 0:
-                    line = self.serial_conn.readline()
-                    try:
-                        line = line.decode('utf-8', errors='ignore')
-                    except UnicodeDecodeError:
-                        self.parse_errors += 1
-                        continue
+        # Process complete lines
+        while '\n' in self._rx_text_buffer:
+            line, self._rx_text_buffer = self._rx_text_buffer.split('\n', 1)
+            line = line + '\n'  # restore newline for consistency with original
 
-                    parsed = parse_packet(line)
-                    if parsed:
-                        ts, ax, ay, az, ppg = parsed
-                        self.buffer.append(ts, ax, ay, az, ppg)
-                    else:
-                        self.parse_errors += 1
-                        if self.parse_errors <= 5:
-                            log.warning(f"Parse error on: {line[:50]!r}")
-                else:
-                    time.sleep(0.01)  # 10ms poll interval
+            parsed = parse_packet(line)
+            if parsed:
+                ts, ax, ay, az, ppg = parsed
+                self.buffer.append(ts, ax, ay, az, ppg)
+                self.lines_ok += 1
+            else:
+                # Ignore empty fragments quietly; count others as errors
+                if line.strip():
+                    self.parse_errors += 1
+                    if self.parse_errors <= 5:
+                        log.warning(f"Parse error on: {line[:80]!r}")
 
-            except serial.SerialException as e:
-                log.error(f"Serial error: {e}")
-                time.sleep(1.0)  # Back off before retry
-
-            except Exception as e:
-                log.error(f"Reader error: {e}")
-                time.sleep(0.1)
-
-        log.info("Serial reader stopped")
+    def _on_notify(self, _, data: bytearray):
+        """
+        Bleak notification callback (runs in asyncio thread context).
+        """
+        try:
+            text = data.decode("utf-8", errors="ignore")
+            self._handle_text_chunk(text)
+        except Exception as e:
+            self.parse_errors += 1
+            if self.parse_errors <= 5:
+                log.warning(f"Notify decode/parse error: {e}")
 
     def _inference_loop(self):
-        """Thread: trigger inference every 12.5 seconds."""
         log.info(f"Inference loop started (every {WINDOW_DURATION_SEC}s)")
 
         while self.running:
             time.sleep(WINDOW_DURATION_SEC)
-
             if not self.running:
                 break
 
             ax, ay, az, ppg, count = self.buffer.get_window()
-
             if ax is None:
                 log.warning(f"Insufficient data: {count}/{WINDOW_SAMPLES} samples")
                 continue
@@ -208,7 +204,6 @@ class RealtimeSeizureDetector:
 
                 result = self.detector.predict(ax, ay, az, ppg, verbose=False)
 
-                # Output result
                 classification = result['classification']
                 probability = result['combined_seizure_probability']
                 confidence = result['confidence']
@@ -218,7 +213,6 @@ class RealtimeSeizureDetector:
                 else:
                     log.info(f"Normal: {probability:.1f}% seizure probability")
 
-                # Component breakdown
                 accel_prob = result['accelerometer']['seizure_probability']
                 hrv_prob = result['hrv']['seizure_probability']
                 log.info(f"  Accel: {accel_prob:.1f}% | HRV: {hrv_prob:.1f}%")
@@ -231,61 +225,80 @@ class RealtimeSeizureDetector:
 
         log.info("Inference loop stopped")
 
-    def start(self):
-        """Start the real-time detection system."""
-        try:
-            # Initialize ML model first (fail fast if files missing)
-            self._init_detector()
+    async def _ble_main(self):
+        """
+        Async BLE logic: scan, connect, subscribe, keep alive until stopped.
+        """
+        log.info("Scanning for BLE device...")
+        dev = await BleakScanner.find_device_by_filter(
+            lambda d, ad: d.name == self.device_name,
+            timeout=10.0
+        )
 
-            # Open serial connection
-            log.info(f"Opening serial port {self.serial_port} at {self.baud_rate} baud")
-            self.serial_conn = serial.Serial(
-                port=self.serial_port,
-                baudrate=self.baud_rate,
-                timeout=1.0
-            )
+        if not dev:
+            raise RuntimeError(f"Could not find BLE device named {self.device_name!r}")
 
-            self.running = True
+        log.info(f"Connecting to {dev.address} ({self.device_name})")
+        async with BleakClient(dev) as client:
+            log.info(f"Connected: {client.is_connected}")
 
-            # Start reader thread
-            self.reader_thread = threading.Thread(target=self._serial_reader, daemon=True)
-            self.reader_thread.start()
-
-            # Start inference thread
-            self.inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
-            self.inference_thread.start()
-
-            log.info("System started. Waiting for data...")
+            # Subscribe to notifications
+            await client.start_notify(self.char_uuid, self._on_notify)
+            log.info("Subscribed. Waiting for data...")
             log.info(f"First inference in {WINDOW_DURATION_SEC}s after buffer fills")
 
-        except serial.SerialException as e:
-            log.error(f"Failed to open serial port: {e}")
-            raise
+            # Keep alive until stop() flips running off
+            while self.running and client.is_connected:
+                await asyncio.sleep(0.5)
 
-        except Exception as e:
-            log.error(f"Startup error: {e}")
-            raise
+            # Best effort cleanup
+            try:
+                await client.stop_notify(self.char_uuid)
+            except Exception:
+                pass
+
+    def start(self):
+        """
+        Start detector:
+        - load model
+        - start inference thread
+        - run BLE loop in background thread (asyncio)
+        """
+        self._init_detector()
+        self.running = True
+
+        # Start inference thread
+        self.inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
+        self.inference_thread.start()
+
+        # Run BLE loop on its own thread so main thread can handle Ctrl+C cleanly
+        def _run_ble():
+            try:
+                asyncio.run(self._ble_main())
+            except Exception as e:
+                log.error(f"BLE error: {e}")
+                self.running = False
+
+        self.ble_thread = threading.Thread(target=_run_ble, daemon=True)
+        self.ble_thread.start()
 
     def stop(self):
-        """Stop the detection system gracefully."""
         log.info("Shutting down...")
         self.running = False
 
-        if self.reader_thread:
-            self.reader_thread.join(timeout=2.0)
+        if getattr(self, "ble_thread", None):
+            self.ble_thread.join(timeout=2.0)
 
         if self.inference_thread:
             self.inference_thread.join(timeout=2.0)
 
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
-
-        log.info(f"Shutdown complete. Inferences: {self.inference_count}, Parse errors: {self.parse_errors}")
+        log.info(
+            f"Shutdown complete. Inferences: {self.inference_count}, "
+            f"Samples OK: {self.lines_ok}, Parse errors: {self.parse_errors}"
+        )
 
     def run(self):
-        """Main entry point - start and wait for Ctrl+C."""
         self.start()
-
         try:
             while self.running:
                 time.sleep(0.5)
@@ -295,38 +308,28 @@ class RealtimeSeizureDetector:
             self.stop()
 
 
-def list_serial_ports():
-    """List available serial ports."""
-    import serial.tools.list_ports
-    ports = serial.tools.list_ports.comports()
-
-    if not ports:
-        print("No serial ports found")
-        return []
-
-    print("Available serial ports:")
-    for port in ports:
-        print(f"  {port.device} - {port.description}")
-
-    return [p.device for p in ports]
-
+# ============================================================================
+# CLI
+# ============================================================================
 
 def main():
-    """Entry point with argument handling."""
-    if len(sys.argv) < 2:
-        print("Usage: python realtime_detector.py <serial_port>")
-        print("       python realtime_detector.py --list")
-        print()
-        list_serial_ports()
-        sys.exit(1)
+    """
+    Usage:
+      python realtime_detector_ble.py
+      python realtime_detector_ble.py --name LipsyGuard --uuid abcdefab-...
+    """
+    name = DEVICE_NAME
+    uuid = CHAR_UUID
 
-    if sys.argv[1] == '--list':
-        list_serial_ports()
-        sys.exit(0)
+    args = sys.argv[1:]
+    if "--name" in args:
+        i = args.index("--name")
+        name = args[i + 1]
+    if "--uuid" in args:
+        i = args.index("--uuid")
+        uuid = args[i + 1]
 
-    serial_port = sys.argv[1]
-
-    detector = RealtimeSeizureDetector(serial_port)
+    detector = RealtimeSeizureDetectorBLE(device_name=name, char_uuid=uuid)
     detector.run()
 
 
