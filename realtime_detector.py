@@ -57,8 +57,8 @@ class SensorBuffer:
 
             if self.last_timestamp is not None:
                 gap_ms = timestamp_ms - self.last_timestamp
-                if gap_ms > 100:
-                    log.warning(f"Timestamp gap: {gap_ms}ms (expected ~62.5ms)")
+                if gap_ms > 105:
+                    log.warning(f"Timestamp difference: {gap_ms}ms")
             self.last_timestamp = timestamp_ms
 
     def get_window(self):
@@ -93,7 +93,6 @@ def parse_packet(line: str):
     Returns tuple or None.
     """
     try:
-        print("Got packet")
         line = line.strip()
 
         if not line or line.startswith('#'):
@@ -195,7 +194,7 @@ class RealtimeSeizureDetectorBLE:
 
             ax, ay, az, ppg, count = self.buffer.get_window()
             if ax is None:
-                log.warning(f"Insufficient data: {count}/{WINDOW_SAMPLES} samples")
+                log.info(f"\n\n--- Inferences Starting ---\n")
                 continue
 
             try:
@@ -209,16 +208,13 @@ class RealtimeSeizureDetectorBLE:
                 confidence = result['confidence']
 
                 if result['is_seizure']:
-                    log.warning(f"SEIZURE DETECTED: {probability:.1f}% (confidence: {confidence:.1f}%)")
+                    log.info(f"SEIZURE DETECTED: {probability:.1f}% (confidence: {confidence:.1f}%)")
                 else:
-                    log.info(f"Normal: {probability:.1f}% seizure probability")
+                    log.info(f"NORMAL: {probability:.1f}% seizure probability")
 
                 accel_prob = result['accelerometer']['seizure_probability']
                 hrv_prob = result['hrv']['seizure_probability']
-                log.info(f"  Accel: {accel_prob:.1f}% | HRV: {hrv_prob:.1f}%")
-
-                if result['hrv'].get('error'):
-                    log.warning(f"  HRV error: {result['hrv']['error']}")
+                log.info(f"  Accelerometer Probability: {accel_prob:.1f}% | Heart Rate Variability: {hrv_prob:.1f}% \n")
 
             except Exception as e:
                 log.error(f"Inference error: {e}")
@@ -245,7 +241,7 @@ class RealtimeSeizureDetectorBLE:
             # Subscribe to notifications
             await client.start_notify(self.char_uuid, self._on_notify)
             log.info("Subscribed. Waiting for data...")
-            log.info(f"First inference in {WINDOW_DURATION_SEC}s after buffer fills")
+            log.info(f"First inference in 25s after buffer fills")
 
             # Keep alive until stop() flips running off
             while self.running and client.is_connected:
