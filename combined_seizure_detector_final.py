@@ -64,7 +64,7 @@ class AccelerometerSeizureDetector:
 
         return {
             'seizure_probability': seizure_probability,
-            'is_seizure': seizure_probability >= 50.0,
+            'is_seizure': seizure_probability >= 85.0,
             'predicted_class': predicted_class,
             'confidence': float(proba[predicted_class_idx] * 100)
         }
@@ -287,7 +287,7 @@ class CombinedSeizureDetector:
             self.hrv_weight * hrv_prob
         )
 
-        is_seizure = combined_probability >= 50.0
+        is_seizure = combined_probability >= 85.0
         confidence = combined_probability if is_seizure else (100 - combined_probability)
 
         result = {
@@ -417,7 +417,7 @@ def main():
     """Example usage"""
     print("\n" + "=" * 70)
     print("COMBINED SEIZURE DETECTION SYSTEM")
-    print("Accelerometer ML (70%) + HRV Analysis (30%)")
+    print("Accelerometer ML (90%) + HRV Analysis (10%)")
     print("=" * 70 + "\n")
 
     # Initialize
