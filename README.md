@@ -2,6 +2,9 @@
 
 Real-time seizure detection wearable using an ESP32-C3, PPG sensor, and IMU with an on-laptop ML inference pipeline.
 
+<img width="457" height="608" alt="Screenshot 2026-01-18 at 11 13 28 AM" src="https://github.com/user-attachments/assets/5b56482d-0721-45ba-a0dc-d768a6c1691f" />
+
+
 ## How It Works
 
 ```
@@ -9,6 +12,9 @@ Real-time seizure detection wearable using an ESP32-C3, PPG sensor, and IMU with
                  ├── I2C ──► [ESP32-C3 Mini] ──► BLE ──► [Laptop Python ML]
 [LSM6DS3TR-C]   ┘
 ```
+
+<img width="668" height="391" alt="Screenshot 2025-12-22 at 8 17 23 AM" src="https://github.com/user-attachments/assets/ea0943b4-c9fa-4b03-8012-568c264e2c3f" />
+
 
 The ESP32 samples both sensors at 16 Hz and streams CSV packets over BLE. The laptop buffers 200 samples (12.5 s windows) and runs inference every window using a CNN trained on triaxial accelerometer data, fused with an HRV score from the PPG signal.
 
